@@ -26,14 +26,13 @@ export class AuthService {
 
     const accessToken = signAccessToken({ sub: user.id, roles: user.roles });
 
-    // Generate a token id (jti) and include it in the refresh token payload so we can lookup directly
+    // Use token id (jti) for direct indexed DB lookup, avoiding full-table scans
     const tokenId = randomUUID();
     const refreshTokenRaw = signRefreshToken({ sub: user.id, jti: tokenId });
 
     const expiresAt = add(new Date(), { days: refreshTokenTTLDays });
     const tokenHash = await hashToken(refreshTokenRaw);
 
-    // Create refresh token record with deterministic id equal to tokenId
     const rt = this.tokenRepo.create({ id: tokenId, user, tokenHash, expiresAt });
     await this.tokenRepo.save(rt);
 
@@ -49,7 +48,7 @@ export class AuthService {
     const user = await this.userRepo.findOne(userId);
     if (!user) throw new Error("Invalid token");
 
-    // Find the refresh token by ID (no full scan)
+    // Indexed lookup using jti ID
     const matched = await this.tokenRepo.findOne(tokenId as any);
     if (!matched) throw new Error("Refresh token not found or revoked");
 
@@ -59,7 +58,7 @@ export class AuthService {
     if (matched.revoked) throw new Error("Token revoked");
     if (!isAfter(matched.expiresAt, new Date())) throw new Error("Token expired");
 
-    // rotate: revoke old and create new
+    // Rotation: revoke current and issue a new token with a new jti
     matched.revoked = true;
     const newTokenId = randomUUID();
     const newRefreshRaw = signRefreshToken({ sub: user.id, jti: newTokenId });

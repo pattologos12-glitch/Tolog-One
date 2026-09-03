@@ -1,9 +1,10 @@
 import { getRepository } from "typeorm";
 import { User } from "../entities/User";
 import { RefreshToken } from "../entities/RefreshToken";
-import { signAccessToken, signRefreshToken, verifyRefreshToken, verifyAccessToken } from "../utils/jwt";
+import { signAccessToken, signRefreshToken, verifyRefreshToken } from "../utils/jwt";
 import { hashPassword, verifyPassword, hashToken, verifyTokenHash } from "../utils/hash";
 import { add, isAfter } from "date-fns";
+import { randomUUID } from "crypto";
 
 const refreshTokenTTLDays = Number(process.env.REFRESH_TOKEN_DAYS || 30);
 
@@ -24,10 +25,16 @@ export class AuthService {
     if (!ok) throw new Error("Invalid credentials");
 
     const accessToken = signAccessToken({ sub: user.id, roles: user.roles });
-    const refreshTokenRaw = signRefreshToken({ sub: user.id });
+
+    // Generate a token id (jti) and include it in the refresh token payload so we can lookup directly
+    const tokenId = randomUUID();
+    const refreshTokenRaw = signRefreshToken({ sub: user.id, jti: tokenId });
+
     const expiresAt = add(new Date(), { days: refreshTokenTTLDays });
     const tokenHash = await hashToken(refreshTokenRaw);
-    const rt = this.tokenRepo.create({ user, tokenHash, expiresAt });
+
+    // Create refresh token record with deterministic id equal to tokenId
+    const rt = this.tokenRepo.create({ id: tokenId, user, tokenHash, expiresAt });
     await this.tokenRepo.save(rt);
 
     return { user, accessToken, refreshToken: refreshTokenRaw, refreshTokenId: rt.id };
@@ -36,24 +43,28 @@ export class AuthService {
   async refresh(oldRefreshToken: string) {
     const payload: any = verifyRefreshToken(oldRefreshToken) as any;
     const userId = payload.sub;
+    const tokenId = payload.jti;
+    if (!tokenId) throw new Error("Invalid token payload");
+
     const user = await this.userRepo.findOne(userId);
     if (!user) throw new Error("Invalid token");
 
-    const tokens = await this.tokenRepo.find({ where: { user }, order: { createdAt: "DESC" } });
-    let matched: RefreshToken | undefined;
-    for (const t of tokens) {
-      const ok = await verifyTokenHash(oldRefreshToken, t.tokenHash);
-      if (ok) { matched = t; break; }
-    }
+    // Find the refresh token by ID (no full scan)
+    const matched = await this.tokenRepo.findOne(tokenId as any);
     if (!matched) throw new Error("Refresh token not found or revoked");
+
+    const ok = await verifyTokenHash(oldRefreshToken, matched.tokenHash);
+    if (!ok) throw new Error("Refresh token invalid");
 
     if (matched.revoked) throw new Error("Token revoked");
     if (!isAfter(matched.expiresAt, new Date())) throw new Error("Token expired");
 
+    // rotate: revoke old and create new
     matched.revoked = true;
-    const newRefreshRaw = signRefreshToken({ sub: user.id });
+    const newTokenId = randomUUID();
+    const newRefreshRaw = signRefreshToken({ sub: user.id, jti: newTokenId });
     const newHash = await hashToken(newRefreshRaw);
-    const newRt = this.tokenRepo.create({ user, tokenHash: newHash, expiresAt: add(new Date(), { days: refreshTokenTTLDays }) });
+    const newRt = this.tokenRepo.create({ id: newTokenId, user, tokenHash: newHash, expiresAt: add(new Date(), { days: refreshTokenTTLDays }) });
     await this.tokenRepo.save(newRt);
     matched.replacedByTokenId = newRt.id;
     await this.tokenRepo.save(matched);
@@ -63,20 +74,22 @@ export class AuthService {
   }
 
   async revokeRefresh(tokenRaw: string) {
-    const tokens = await this.tokenRepo.find();
-    for (const t of tokens) {
-      const ok = await verifyTokenHash(tokenRaw, t.tokenHash);
-      if (ok) {
-        t.revoked = true;
-        await this.tokenRepo.save(t);
-        return true;
-      }
+    try {
+      const payload: any = verifyRefreshToken(tokenRaw) as any;
+      const tokenId = payload.jti;
+      if (!tokenId) return false;
+      const t = await this.tokenRepo.findOne(tokenId as any);
+      if (!t) return false;
+      t.revoked = true;
+      await this.tokenRepo.save(t);
+      return true;
+    } catch (e) {
+      return false;
     }
-    return false;
   }
 
   async getUserFromAccessToken(accessToken: string) {
-    const payload: any = verifyAccessToken(accessToken) as any;
+    const payload: any = (await import("../utils/jwt")).verifyAccessToken(accessToken) as any;
     return this.userRepo.findOne(payload.sub);
   }
 }

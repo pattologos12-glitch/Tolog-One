@@ -3,6 +3,7 @@ import express from "express";
 import cookieParser from "cookie-parser";
 import { createConnection } from "typeorm";
 import authRoutes from "./routes/auth.routes";
+import contextRoutes from "./routes/context.routes";
 
 async function start() {
   await createConnection();
@@ -11,6 +12,7 @@ async function start() {
   app.use(cookieParser());
 
   app.use("/auth", authRoutes);
+  app.use("/context", contextRoutes);
 
   const port = process.env.PORT || 4000;
   app.listen(port, () => {
